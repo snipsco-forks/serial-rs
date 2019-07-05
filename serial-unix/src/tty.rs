@@ -87,7 +87,7 @@ impl TTYPort {
 
         unsafe {
             // get exclusive access to device
-            if libc::ioctl(port.fd, TIOCEXCL) < 0 {
+            if libc::ioctl(port.fd, TIOCEXCL as _) < 0 {
                 return Err(super::error::last_os_error());
             }
 
@@ -143,7 +143,7 @@ impl Drop for TTYPort {
         use libc::{TIOCNXCL};
 
         unsafe {
-            libc::ioctl(self.fd, TIOCNXCL);
+            libc::ioctl(self.fd, TIOCNXCL as _);
             libc::close(self.fd);
         }
     }
