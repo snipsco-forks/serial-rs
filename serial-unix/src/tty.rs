@@ -1,10 +1,31 @@
+// Copyright (c) 2015 David Cuddeback
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 use core;
 use libc;
-use termios;
-use ioctl;
 
 use std::ffi::CString;
+use std::fmt;
 use std::io;
+use std::mem;
 use std::path::Path;
 use std::time::Duration;
 
@@ -14,15 +35,11 @@ use libc::{c_int, c_void, size_t};
 
 use core::{SerialDevice, SerialPortSettings};
 
+#[cfg(not(target_os = "linux"))]
+use termios;
 
 #[cfg(target_os = "linux")]
-const O_NOCTTY: c_int = 0x00000100;
-
-#[cfg(target_os = "macos")]
-const O_NOCTTY: c_int = 0x00020000;
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-const O_NOCTTY: c_int = 0;
+use termios2 as termios;
 
 
 /// A TTY-based serial port implementation.
@@ -51,7 +68,7 @@ impl TTYPort {
     /// * `InvalidInput` if `port` is not a valid device name.
     /// * `Io` for any other error while opening or initializing the device.
     pub fn open(path: &Path) -> core::Result<Self> {
-        use libc::{O_RDWR, O_NONBLOCK, F_SETFL, EINVAL};
+        use libc::{O_RDWR, O_NOCTTY, O_NONBLOCK, TIOCEXCL, F_SETFL, EINVAL};
 
         let cstr = match CString::new(path.as_os_str().as_bytes()) {
             Ok(s) => s,
@@ -68,14 +85,16 @@ impl TTYPort {
             timeout: Duration::from_millis(100),
         };
 
-        // get exclusive access to device
-        if let Err(err) = ioctl::tiocexcl(port.fd) {
-            return Err(super::error::from_io_error(err));
-        }
+        unsafe {
+            // get exclusive access to device
+            if libc::ioctl(port.fd, TIOCEXCL) < 0 {
+                return Err(super::error::last_os_error());
+            }
 
-        // clear O_NONBLOCK flag
-        if unsafe { libc::fcntl(port.fd, F_SETFL, 0) } < 0 {
-            return Err(super::error::last_os_error());
+            // clear O_NONBLOCK flag
+            if libc::fcntl(port.fd, F_SETFL, 0) < 0 {
+                return Err(super::error::last_os_error());
+            }
         }
 
         // apply initial settings
@@ -86,33 +105,45 @@ impl TTYPort {
     }
 
     fn set_pin(&mut self, pin: c_int, level: bool) -> core::Result<()> {
-        let retval = if level {
-            ioctl::tiocmbis(self.fd, pin)
-        }
-        else {
-            ioctl::tiocmbic(self.fd, pin)
+        use libc::{TIOCMBIS, TIOCMBIC};
+
+        let retval = unsafe {
+            if level {
+                libc::ioctl(self.fd, TIOCMBIS, &pin)
+            }
+            else {
+                libc::ioctl(self.fd, TIOCMBIC, &pin)
+            }
         };
 
-        match retval {
-            Ok(()) => Ok(()),
-            Err(err) => Err(super::error::from_io_error(err)),
+        if retval < 0 {
+            return Err(super::error::last_os_error());
         }
+
+        Ok(())
     }
 
     fn read_pin(&mut self, pin: c_int) -> core::Result<bool> {
-        match ioctl::tiocmget(self.fd) {
-            Ok(pins) => Ok(pins & pin != 0),
-            Err(err) => Err(super::error::from_io_error(err)),
+        use libc::{TIOCMGET};
+
+        unsafe {
+            let mut pins: c_int = mem::uninitialized();
+
+            if libc::ioctl(self.fd, TIOCMGET, &mut pins) < 0 {
+                return Err(super::error::last_os_error());
+            }
+
+            Ok(pins & pin != 0)
         }
     }
 }
 
 impl Drop for TTYPort {
     fn drop(&mut self) {
-        #![allow(unused_must_use)]
-        ioctl::tiocnxcl(self.fd);
+        use libc::{TIOCNXCL};
 
         unsafe {
+            libc::ioctl(self.fd, TIOCNXCL);
             libc::close(self.fd);
         }
     }
@@ -158,7 +189,14 @@ impl io::Write for TTYPort {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        termios::tcdrain(self.fd)
+        unsafe {
+            if libc::tcdrain(self.fd) < 0 {
+                Err(io::Error::last_os_error())
+            }
+            else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -166,16 +204,13 @@ impl SerialDevice for TTYPort {
     type Settings = TTYSettings;
 
     fn read_settings(&self) -> core::Result<TTYSettings> {
-        use termios::{CREAD, CLOCAL}; // cflags
-        use termios::{ICANON, ECHO, ECHOE, ECHOK, ECHONL, ISIG, IEXTEN}; // lflags
-        use termios::{OPOST}; // oflags
-        use termios::{INLCR, IGNCR, ICRNL, IGNBRK}; // iflags
-        use termios::{VMIN, VTIME}; // c_cc indexes
+        use libc::{CREAD, CLOCAL}; // cflags
+        use libc::{ICANON, ECHO, ECHOE, ECHOK, ECHONL, ISIG, IEXTEN}; // lflags
+        use libc::{OPOST}; // oflags
+        use libc::{INLCR, IGNCR, ICRNL, IGNBRK}; // iflags
+        use libc::{VMIN, VTIME}; // c_cc indexes
 
-        let mut termios = match termios::Termios::from_fd(self.fd) {
-            Ok(t) => t,
-            Err(e) => return Err(super::error::from_io_error(e)),
-        };
+        let mut termios = try!(termios::read(self.fd));
 
         // setup TTY for binary serial port access
         termios.c_cflag |= CREAD | CLOCAL;
@@ -190,17 +225,8 @@ impl SerialDevice for TTYPort {
     }
 
     fn write_settings(&mut self, settings: &TTYSettings) -> core::Result<()> {
-        use termios::{tcsetattr, tcflush};
-        use termios::{TCSANOW, TCIOFLUSH};
-
-        // write settings to TTY
-        if let Err(err) = tcsetattr(self.fd, TCSANOW, &settings.termios) {
-            return Err(super::error::from_io_error(err));
-        }
-
-        if let Err(err) = tcflush(self.fd, TCIOFLUSH) {
-            return Err(super::error::from_io_error(err));
-        }
+        try!(termios::write(self.fd, &settings.termios));
+        try!(termios::flush(self.fd));
 
         Ok(())
     }
@@ -215,125 +241,148 @@ impl SerialDevice for TTYPort {
     }
 
     fn set_rts(&mut self, level: bool) -> core::Result<()> {
-        self.set_pin(ioctl::TIOCM_RTS, level)
+        self.set_pin(libc::TIOCM_RTS, level)
     }
 
     fn set_dtr(&mut self, level: bool) -> core::Result<()> {
-        self.set_pin(ioctl::TIOCM_DTR, level)
+        self.set_pin(libc::TIOCM_DTR, level)
     }
 
     fn read_cts(&mut self) -> core::Result<bool> {
-        self.read_pin(ioctl::TIOCM_CTS)
+        self.read_pin(libc::TIOCM_CTS)
     }
 
     fn read_dsr(&mut self) -> core::Result<bool> {
-        self.read_pin(ioctl::TIOCM_DSR)
+        self.read_pin(libc::TIOCM_DSR)
     }
 
     fn read_ri(&mut self) -> core::Result<bool> {
-        self.read_pin(ioctl::TIOCM_RI)
+        self.read_pin(libc::TIOCM_RI)
     }
 
     fn read_cd(&mut self) -> core::Result<bool> {
-        self.read_pin(ioctl::TIOCM_CD)
+        self.read_pin(libc::TIOCM_CD)
     }
 }
 
 /// Serial port settings for TTY devices.
-#[derive(Debug,Copy,Clone)]
+#[derive(Copy,Clone)]
 pub struct TTYSettings {
-    termios: termios::Termios,
+    termios: termios::termios,
 }
 
 impl TTYSettings {
-    fn new(termios: termios::Termios) -> Self {
+    fn new(termios: termios::termios) -> Self {
         TTYSettings { termios: termios }
+    }
+}
+
+impl fmt::Debug for TTYSettings {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        struct TermiosFormatter(termios::termios);
+
+        impl fmt::Debug for TermiosFormatter {
+            fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+                f.debug_struct("termios")
+                    .field("c_iflag", &self.0.c_iflag)
+                    .field("c_oflag", &self.0.c_oflag)
+                    .field("c_cflag", &self.0.c_cflag)
+                    .field("c_lflag", &self.0.c_lflag)
+                    .field("c_cc", &self.0.c_cc)
+                    .finish()
+            }
+        }
+
+        f.debug_struct("TTYSettings")
+            .field("termios", &TermiosFormatter(self.termios))
+            .finish()
     }
 }
 
 impl SerialPortSettings for TTYSettings {
     fn baud_rate(&self) -> Option<core::BaudRate> {
-        use termios::{cfgetospeed, cfgetispeed};
-        use termios::{B50, B75, B110, B134, B150, B200, B300, B600, B1200, B1800, B2400, B4800, B9600, B19200, B38400};
-        use termios::os::target::{B57600, B115200, B230400};
+        use libc::{B50, B75, B110, B134, B150, B200, B300, B600, B1200, B1800, B2400, B4800, B9600, B19200, B38400};
+        use libc::{B57600, B115200, B230400};
 
         #[cfg(target_os = "linux")]
-        use termios::os::linux::{B460800, B500000, B576000, B921600, B1000000, B1152000, B1500000, B2000000, B2500000, B3000000, B3500000, B4000000};
+        use libc::{B460800, B500000, B576000, B921600, B1000000, B1152000, B1500000, B2000000, B2500000, B3000000, B3500000, B4000000};
 
         #[cfg(target_os = "macos")]
-        use termios::os::macos::{B7200, B14400, B28800, B76800};
+        use libc::{B7200, B14400, B28800, B76800};
 
         #[cfg(target_os = "freebsd")]
-        use termios::os::freebsd::{B7200, B14400, B28800, B76800, B460800, B921600};
+        use libc::{B7200, B14400, B28800, B76800, B460800, B921600};
 
         #[cfg(target_os = "openbsd")]
-        use termios::os::openbsd::{B7200, B14400, B28800, B76800};
+        use libc::{B7200, B14400, B28800, B76800};
 
-        let ospeed = cfgetospeed(&self.termios);
-        let ispeed = cfgetispeed(&self.termios);
+        let (ospeed, ispeed) = termios::get_speed(&self.termios);
 
         if ospeed != ispeed {
             return None;
         }
 
         match ospeed {
-            B50      => Some(core::BaudOther(50)),
-            B75      => Some(core::BaudOther(75)),
-            B110     => Some(core::Baud110),
-            B134     => Some(core::BaudOther(134)),
-            B150     => Some(core::BaudOther(150)),
-            B200     => Some(core::BaudOther(200)),
-            B300     => Some(core::Baud300),
-            B600     => Some(core::Baud600),
-            B1200    => Some(core::Baud1200),
-            B1800    => Some(core::BaudOther(1800)),
-            B2400    => Some(core::Baud2400),
-            B4800    => Some(core::Baud4800),
-            #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-            B7200    => Some(core::BaudOther(7200)),
-            B9600    => Some(core::Baud9600),
-            #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-            B14400   => Some(core::BaudOther(14400)),
-            B19200   => Some(core::Baud19200),
-            #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-            B28800   => Some(core::BaudOther(28800)),
-            B38400   => Some(core::Baud38400),
-            B57600   => Some(core::Baud57600),
-            #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-            B76800   => Some(core::BaudOther(76800)),
-            B115200  => Some(core::Baud115200),
-            B230400  => Some(core::BaudOther(230400)),
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            B460800  => Some(core::BaudOther(460800)),
-            #[cfg(target_os = "linux")]
-            B500000  => Some(core::BaudOther(500000)),
-            #[cfg(target_os = "linux")]
-            B576000  => Some(core::BaudOther(576000)),
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            B921600  => Some(core::BaudOther(921600)),
-            #[cfg(target_os = "linux")]
-            B1000000 => Some(core::BaudOther(1000000)),
-            #[cfg(target_os = "linux")]
-            B1152000 => Some(core::BaudOther(1152000)),
-            #[cfg(target_os = "linux")]
-            B1500000 => Some(core::BaudOther(1500000)),
-            #[cfg(target_os = "linux")]
-            B2000000 => Some(core::BaudOther(2000000)),
-            #[cfg(target_os = "linux")]
-            B2500000 => Some(core::BaudOther(2500000)),
-            #[cfg(target_os = "linux")]
-            B3000000 => Some(core::BaudOther(3000000)),
-            #[cfg(target_os = "linux")]
-            B3500000 => Some(core::BaudOther(3500000)),
-            #[cfg(target_os = "linux")]
-            B4000000 => Some(core::BaudOther(4000000)),
+            termios::Speed::Standard(baud) => match baud {
+                B50      => Some(core::BaudOther(50)),
+                B75      => Some(core::BaudOther(75)),
+                B110     => Some(core::Baud110),
+                B134     => Some(core::BaudOther(134)),
+                B150     => Some(core::BaudOther(150)),
+                B200     => Some(core::BaudOther(200)),
+                B300     => Some(core::Baud300),
+                B600     => Some(core::Baud600),
+                B1200    => Some(core::Baud1200),
+                B1800    => Some(core::BaudOther(1800)),
+                B2400    => Some(core::Baud2400),
+                B4800    => Some(core::Baud4800),
+                #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+                B7200    => Some(core::BaudOther(7200)),
+                B9600    => Some(core::Baud9600),
+                #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+                B14400   => Some(core::BaudOther(14400)),
+                B19200   => Some(core::Baud19200),
+                #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+                B28800   => Some(core::BaudOther(28800)),
+                B38400   => Some(core::Baud38400),
+                B57600   => Some(core::Baud57600),
+                #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+                B76800   => Some(core::BaudOther(76800)),
+                B115200  => Some(core::Baud115200),
+                B230400  => Some(core::BaudOther(230400)),
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                B460800  => Some(core::BaudOther(460800)),
+                #[cfg(target_os = "linux")]
+                B500000  => Some(core::BaudOther(500000)),
+                #[cfg(target_os = "linux")]
+                B576000  => Some(core::BaudOther(576000)),
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                B921600  => Some(core::BaudOther(921600)),
+                #[cfg(target_os = "linux")]
+                B1000000 => Some(core::BaudOther(1000000)),
+                #[cfg(target_os = "linux")]
+                B1152000 => Some(core::BaudOther(1152000)),
+                #[cfg(target_os = "linux")]
+                B1500000 => Some(core::BaudOther(1500000)),
+                #[cfg(target_os = "linux")]
+                B2000000 => Some(core::BaudOther(2000000)),
+                #[cfg(target_os = "linux")]
+                B2500000 => Some(core::BaudOther(2500000)),
+                #[cfg(target_os = "linux")]
+                B3000000 => Some(core::BaudOther(3000000)),
+                #[cfg(target_os = "linux")]
+                B3500000 => Some(core::BaudOther(3500000)),
+                #[cfg(target_os = "linux")]
+                B4000000 => Some(core::BaudOther(4000000)),
 
-            _ => None,
+                _ => None,
+            },
+            termios::Speed::Custom(baud) => Some(core::BaudOther(baud as usize)),
         }
     }
 
     fn char_size(&self) -> Option<core::CharSize> {
-        use termios::{CSIZE, CS5, CS6, CS7, CS8};
+        use libc::{CSIZE, CS5, CS6, CS7, CS8};
 
         match self.termios.c_cflag & CSIZE {
             CS8 => Some(core::Bits8),
@@ -346,7 +395,7 @@ impl SerialPortSettings for TTYSettings {
     }
 
     fn parity(&self) -> Option<core::Parity> {
-        use termios::{PARENB, PARODD};
+        use libc::{PARENB, PARODD};
 
         if self.termios.c_cflag & PARENB != 0 {
             if self.termios.c_cflag & PARODD != 0 {
@@ -362,7 +411,7 @@ impl SerialPortSettings for TTYSettings {
     }
 
     fn stop_bits(&self) -> Option<core::StopBits> {
-        use termios::CSTOPB;
+        use libc::CSTOPB;
 
         if self.termios.c_cflag & CSTOPB != 0 {
             Some(core::Stop2)
@@ -373,8 +422,8 @@ impl SerialPortSettings for TTYSettings {
     }
 
     fn flow_control(&self) -> Option<core::FlowControl> {
-        use termios::{IXON, IXOFF};
-        use termios::os::target::CRTSCTS;
+        use libc::{IXON, IXOFF};
+        use libc::CRTSCTS;
 
         if self.termios.c_cflag & CRTSCTS != 0 {
             Some(core::FlowHardware)
@@ -388,86 +437,83 @@ impl SerialPortSettings for TTYSettings {
     }
 
     fn set_baud_rate(&mut self, baud_rate: core::BaudRate) -> core::Result<()> {
-        use libc::EINVAL;
-        use termios::cfsetspeed;
-        use termios::{B50, B75, B110, B134, B150, B200, B300, B600, B1200, B1800, B2400, B4800, B9600, B19200, B38400};
-        use termios::os::target::{B57600, B115200, B230400};
+        use libc::{B50, B75, B110, B134, B150, B200, B300, B600, B1200, B1800, B2400, B4800, B9600, B19200, B38400};
+        use libc::{B57600, B115200, B230400};
 
         #[cfg(target_os = "linux")]
-        use termios::os::linux::{B460800, B500000, B576000, B921600, B1000000, B1152000, B1500000, B2000000, B2500000, B3000000, B3500000, B4000000};
+        use libc::{B460800, B500000, B576000, B921600, B1000000, B1152000, B1500000, B2000000, B2500000, B3000000, B3500000, B4000000};
 
         #[cfg(target_os = "macos")]
-        use termios::os::macos::{B7200, B14400, B28800, B76800};
+        use libc::{B7200, B14400, B28800, B76800};
 
         #[cfg(target_os = "freebsd")]
-        use termios::os::freebsd::{B7200, B14400, B28800, B76800, B460800, B921600};
+        use libc::{B7200, B14400, B28800, B76800, B460800, B921600};
 
         #[cfg(target_os = "openbsd")]
-        use termios::os::openbsd::{B7200, B14400, B28800, B76800};
+        use libc::{B7200, B14400, B28800, B76800};
 
-        let baud = match baud_rate {
-            core::BaudOther(50)      => B50,
-            core::BaudOther(75)      => B75,
-            core::Baud110            => B110,
-            core::BaudOther(134)     => B134,
-            core::BaudOther(150)     => B150,
-            core::BaudOther(200)     => B200,
-            core::Baud300            => B300,
-            core::Baud600            => B600,
-            core::Baud1200           => B1200,
-            core::BaudOther(1800)    => B1800,
-            core::Baud2400           => B2400,
-            core::Baud4800           => B4800,
+        let speed = match baud_rate {
+            core::BaudOther(50)      => termios::Speed::Standard(B50),
+            core::BaudOther(75)      => termios::Speed::Standard(B75),
+            core::Baud110            => termios::Speed::Standard(B110),
+            core::BaudOther(134)     => termios::Speed::Standard(B134),
+            core::BaudOther(150)     => termios::Speed::Standard(B150),
+            core::BaudOther(200)     => termios::Speed::Standard(B200),
+            core::Baud300            => termios::Speed::Standard(B300),
+            core::Baud600            => termios::Speed::Standard(B600),
+            core::Baud1200           => termios::Speed::Standard(B1200),
+            core::BaudOther(1800)    => termios::Speed::Standard(B1800),
+            core::Baud2400           => termios::Speed::Standard(B2400),
+            core::Baud4800           => termios::Speed::Standard(B4800),
             #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-            core::BaudOther(7200)    => B7200,
-            core::Baud9600           => B9600,
+            core::BaudOther(7200)    => termios::Speed::Standard(B7200),
+            core::Baud9600           => termios::Speed::Standard(B9600),
             #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-            core::BaudOther(14400)   => B14400,
-            core::Baud19200          => B19200,
+            core::BaudOther(14400)   => termios::Speed::Standard(B14400),
+            core::Baud19200          => termios::Speed::Standard(B19200),
             #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-            core::BaudOther(28800)   => B28800,
-            core::Baud38400          => B38400,
-            core::Baud57600          => B57600,
+            core::BaudOther(28800)   => termios::Speed::Standard(B28800),
+            core::Baud38400          => termios::Speed::Standard(B38400),
+            core::Baud57600          => termios::Speed::Standard(B57600),
             #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
-            core::BaudOther(76800)   => B76800,
-            core::Baud115200         => B115200,
-            core::BaudOther(230400)  => B230400,
+            core::BaudOther(76800)   => termios::Speed::Standard(B76800),
+            core::Baud115200         => termios::Speed::Standard(B115200),
+            core::BaudOther(230400)  => termios::Speed::Standard(B230400),
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            core::BaudOther(460800)  => B460800,
+            core::BaudOther(460800)  => termios::Speed::Standard(B460800),
             #[cfg(target_os = "linux")]
-            core::BaudOther(500000)  => B500000,
+            core::BaudOther(500000)  => termios::Speed::Standard(B500000),
             #[cfg(target_os = "linux")]
-            core::BaudOther(576000)  => B576000,
+            core::BaudOther(576000)  => termios::Speed::Standard(B576000),
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            core::BaudOther(921600)  => B921600,
+            core::BaudOther(921600)  => termios::Speed::Standard(B921600),
             #[cfg(target_os = "linux")]
-            core::BaudOther(1000000) => B1000000,
+            core::BaudOther(1000000) => termios::Speed::Standard(B1000000),
             #[cfg(target_os = "linux")]
-            core::BaudOther(1152000) => B1152000,
+            core::BaudOther(1152000) => termios::Speed::Standard(B1152000),
             #[cfg(target_os = "linux")]
-            core::BaudOther(1500000) => B1500000,
+            core::BaudOther(1500000) => termios::Speed::Standard(B1500000),
             #[cfg(target_os = "linux")]
-            core::BaudOther(2000000) => B2000000,
+            core::BaudOther(2000000) => termios::Speed::Standard(B2000000),
             #[cfg(target_os = "linux")]
-            core::BaudOther(2500000) => B2500000,
+            core::BaudOther(2500000) => termios::Speed::Standard(B2500000),
             #[cfg(target_os = "linux")]
-            core::BaudOther(3000000) => B3000000,
+            core::BaudOther(3000000) => termios::Speed::Standard(B3000000),
             #[cfg(target_os = "linux")]
-            core::BaudOther(3500000) => B3500000,
+            core::BaudOther(3500000) => termios::Speed::Standard(B3500000),
             #[cfg(target_os = "linux")]
-            core::BaudOther(4000000) => B4000000,
+            core::BaudOther(4000000) => termios::Speed::Standard(B4000000),
 
-            core::BaudOther(_) => return Err(super::error::from_raw_os_error(EINVAL)),
+            core::BaudOther(baud) => termios::Speed::Custom(baud as libc::speed_t),
         };
 
-        match cfsetspeed(&mut self.termios, baud) {
-            Ok(()) => Ok(()),
-            Err(err) => Err(super::error::from_io_error(err)),
-        }
+        try!(termios::set_speed(&mut self.termios, speed));
+
+        Ok(())
     }
 
     fn set_char_size(&mut self, char_size: core::CharSize) {
-        use termios::{CSIZE, CS5, CS6, CS7, CS8};
+        use libc::{CSIZE, CS5, CS6, CS7, CS8};
 
         let size = match char_size {
             core::Bits5 => CS5,
@@ -481,7 +527,7 @@ impl SerialPortSettings for TTYSettings {
     }
 
     fn set_parity(&mut self, parity: core::Parity) {
-        use termios::{PARENB, PARODD, INPCK, IGNPAR};
+        use libc::{PARENB, PARODD, INPCK, IGNPAR};
 
         match parity {
             core::ParityNone => {
@@ -504,7 +550,7 @@ impl SerialPortSettings for TTYSettings {
     }
 
     fn set_stop_bits(&mut self, stop_bits: core::StopBits) {
-        use termios::CSTOPB;
+        use libc::CSTOPB;
 
         match stop_bits {
             core::Stop1 => self.termios.c_cflag &= !CSTOPB,
@@ -513,8 +559,8 @@ impl SerialPortSettings for TTYSettings {
     }
 
     fn set_flow_control(&mut self, flow_control: core::FlowControl) {
-        use termios::{IXON, IXOFF};
-        use termios::os::target::CRTSCTS;
+        use libc::{IXON, IXOFF};
+        use libc::CRTSCTS;
 
         match flow_control {
             core::FlowNone => {

@@ -1,6 +1,26 @@
+// Copyright (c) 2015 David Cuddeback
+//
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+//
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 use core;
 
-use std::error::Error;
 use std::ffi::CStr;
 use std::io;
 use std::str;
@@ -24,17 +44,6 @@ pub fn from_raw_os_error(errno: i32) -> core::Error {
     };
 
     core::Error::new(kind, error_string(errno))
-}
-
-pub fn from_io_error(io_error: io::Error) -> core::Error {
-    match io_error.raw_os_error() {
-        Some(errno) => from_raw_os_error(errno),
-        None => {
-            let description = io_error.description().to_string();
-
-            core::Error::new(core::ErrorKind::Io(io_error.kind()), description)
-        }
-    }
 }
 
 // the rest of this module is borrowed from libstd
